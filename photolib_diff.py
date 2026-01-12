@@ -7,9 +7,11 @@ import json
 import os
 import sys
 import time
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+import hashlib
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".heic", ".heif", ".tif", ".tiff"}
 VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".avi", ".mts", ".m2ts", ".3gp"}
@@ -48,6 +50,16 @@ def human_bytes(n: int) -> str:
             return f"{f:,.2f} {u}"
         f /= step
     return f"{f:,.2f} EiB"
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h:
+        return f"{h:d}h {m:02d}m {s:02d}s"
+    return f"{m:d}m {s:02d}s"
 
 
 def ensure_writable_dir(path: Path) -> None:
@@ -108,11 +120,19 @@ def walk_files(roots: Iterable[Path]) -> Iterable[Path]:
                 yield Path(dirpath) / fn
 
 
+def count_files(roots: Iterable[Path]) -> int:
+    total = 0
+    for _ in walk_files(roots):
+        total += 1
+    return total
+
+
 def discover_library(
     name: str,
     root: Path,
     progress_every: int = 5000,
     manifest_path: Optional[Path] = None,
+    precount: bool = False,
 ) -> LibraryInfo:
     if not root.exists():
         raise FileNotFoundError(f"{name} library path does not exist: {root}")
@@ -146,6 +166,11 @@ def discover_library(
 
     vol_root = get_volume_root(root)
     vol_free = get_free_space_bytes(vol_root)
+
+    total_hint: Optional[int] = None
+    if precount:
+        print(f"[{name}] Pre-counting files for progress/ETA...", flush=True)
+        total_hint = count_files(originals_dirs)
 
     total_files = 0
     total_bytes = 0
@@ -201,11 +226,20 @@ def discover_library(
             now = time.time()
             if now - last_print >= 1.0:
                 rate = total_files / max(now - t0, 1e-6)
-                print(
-                    f"[{name}] Discovered {total_files:,} files, {human_bytes(total_bytes)} "
-                    f"({rate:,.0f} files/sec)",
-                    flush=True,
-                )
+                if total_hint:
+                    pct = (total_files / max(total_hint, 1)) * 100.0
+                    remaining = max(total_hint - total_files, 0)
+                    eta = format_duration(remaining / max(rate, 1e-6))
+                    msg = (
+                        f"[{name}] {pct:5.1f}% | {total_files:,}/{total_hint:,} files "
+                        f"({rate:,.0f} files/sec) | ETA {eta}"
+                    )
+                else:
+                    msg = (
+                        f"[{name}] Discovered {total_files:,} files, {human_bytes(total_bytes)} "
+                        f"({rate:,.0f} files/sec)"
+                    )
+                print(msg, flush=True)
                 last_print = now
     if manifest_f:
         manifest_f.close()
@@ -259,6 +293,57 @@ def write_text(path: Path, text: str) -> None:
         f.write(text)
 
 
+def read_manifest(path: Path) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            records.append(json.loads(line))
+    return records
+
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def ensure_outdir_not_inside_library(outdir: Path, master: Path, secondary: Path) -> Optional[str]:
+    for name, pth in [("Master", master), ("Secondary", secondary)]:
+        try:
+            out_resolved = outdir.resolve()
+            lib_resolved = pth.resolve()
+        except FileNotFoundError:
+            out_resolved = outdir
+            lib_resolved = pth
+        if out_resolved == lib_resolved or out_resolved in lib_resolved.parents:
+            return (
+                f"Outdir is inside {name} library bundle. Choose a different output folder.\n"
+                f"  Outdir: {outdir}\n  {name}: {pth}"
+            )
+    return None
+
+
+def ensure_dest_not_inside_library(dest: Path, master: Path, secondary: Path) -> Optional[str]:
+    for name, pth in [("Master", master), ("Secondary", secondary)]:
+        try:
+            dest_resolved = dest.resolve()
+            lib_resolved = pth.resolve()
+        except FileNotFoundError:
+            dest_resolved = dest
+            lib_resolved = pth
+        if dest_resolved == lib_resolved or dest_resolved in lib_resolved.parents:
+            return (
+                f"Destination is inside {name} library bundle. Choose a different folder.\n"
+                f"  Dest: {dest}\n  {name}: {pth}"
+            )
+    return None
+
+
 def estimate_index_size_bytes(master_total_files: int) -> int:
     # Very rough: SQLite index storing path/size/mtime/hash etc.
     # Could vary widely; assume ~250 bytes/record average + overhead.
@@ -272,6 +357,7 @@ def gui_select_paths(
         import tkinter as tk
         from tkinter import filedialog
         from tkinter import messagebox
+        from tkinter import simpledialog
     except Exception as e:
         raise RuntimeError(
             "GUI selection requires Tkinter (usually included with Python on macOS)."
@@ -287,32 +373,88 @@ def gui_select_paths(
 
     def pick_photos_library(title: str) -> Optional[Path]:
         while True:
-            p = pick_dir(title=title, must_exist=True)
+            path = filedialog.askopenfilename(
+                title=title,
+                filetypes=[("Photos Library", "*.photoslibrary"), ("All Files", "*")],
+            )
+            if not path:
+                p = pick_dir(title=title, must_exist=True)
+            else:
+                p = Path(path)
             if p is None:
                 return None
+            if p.is_dir() and not p.name.endswith(".photoslibrary"):
+                candidates = sorted(p.glob("*.photoslibrary"))
+                if len(candidates) == 1:
+                    p = candidates[0]
+                elif len(candidates) > 1:
+                    choices = "\n".join(
+                        [f"{i+1}. {c.name}" for i, c in enumerate(candidates)]
+                    )
+                    prompt = (
+                        "Multiple Photos libraries found in the selected folder.\n\n"
+                        f"{choices}\n\n"
+                        "Enter the number of the library to use:"
+                    )
+                    resp = simpledialog.askstring("Choose Library", prompt)
+                    if resp is None:
+                        return None
+                    try:
+                        idx = int(resp) - 1
+                        p = candidates[idx]
+                    except (ValueError, IndexError):
+                        messagebox.showerror(
+                            "Invalid Selection",
+                            "Please enter a valid number from the list.",
+                        )
+                        continue
             if p.name.endswith(".photoslibrary") and is_photos_library(p):
                 return p
             msg = (
                 "This folder does not look like a standard Photos library bundle.\n\n"
                 f"Selected: {p}\n\n"
+                "Tip: pick the top-level *.photoslibrary bundle.\n"
                 "Continue anyway?"
             )
             if messagebox.askyesno("Confirm Library Selection", msg):
                 return p
 
     if master is None:
-        master = pick_photos_library("Select Master .photoslibrary")
+        messagebox.showinfo(
+            "Select Master Library",
+            "Please select your MASTER Photos library.\n"
+            "Tip: choose the top-level *.photoslibrary bundle.",
+        )
+        master = pick_photos_library(
+            "Select MASTER Photos Library (*.photoslibrary) — your primary library"
+        )
     if secondary is None:
-        secondary = pick_photos_library("Select Secondary .photoslibrary")
+        messagebox.showinfo(
+            "Select Secondary Library",
+            "Please select your SECONDARY Photos library.\n"
+            "Tip: choose the top-level *.photoslibrary bundle.",
+        )
+        secondary = pick_photos_library(
+            "Select SECONDARY Photos Library (*.photoslibrary) — the library to compare"
+        )
     if outdir is None:
-        outdir = pick_dir("Select Output Folder (you can create a new folder)", must_exist=False)
+        messagebox.showinfo(
+            "Select Output Folder",
+            "Please select an OUTPUT folder.\n"
+            "This must be a safe location and NOT inside a Photos library.",
+        )
+        outdir = pick_dir(
+            "Select OUTPUT folder (safe location; not inside a Photos library)",
+            must_exist=False,
+        )
 
     if master and secondary and outdir:
         confirm_msg = (
             "Please confirm your selections:\n\n"
-            f"Master:    {master}\n"
-            f"Secondary: {secondary}\n"
-            f"Outdir:    {outdir}"
+            f"MASTER library:    {master}\n"
+            f"SECONDARY library: {secondary}\n"
+            f"OUTPUT folder:     {outdir}\n\n"
+            "Discovery will READ from the libraries and WRITE only into the output folder."
         )
         if not messagebox.askokcancel("Confirm Paths", confirm_msg):
             root.destroy()
@@ -335,6 +477,11 @@ def main() -> int:
     p.add_argument("--gui", action="store_true", help="Select folders via a GUI.")
     p.add_argument("--strict", action="store_true", help="Fail if paths do not look like Photos libraries.")
     p.add_argument("--progress-every", type=int, default=5000, help="Print progress every N files.")
+    p.add_argument(
+        "--no-precount",
+        action="store_true",
+        help="Skip the pre-count pass (faster start, but no percent/ETA during discovery).",
+    )
 
     # Optional counts from Photos.app for sanity checking
     p.add_argument("--master-photos-count", type=int, default=None)
@@ -342,7 +489,345 @@ def main() -> int:
     p.add_argument("--secondary-photos-count", type=int, default=None)
     p.add_argument("--secondary-videos-count", type=int, default=None)
 
+    p1 = sub.add_parser("phase1", help="Phase 1: index + compare using manifests.")
+    p1.add_argument("--outdir", required=True, help="Output directory used in Phase 0.")
+    p1.add_argument(
+        "--hash",
+        choices=["none", "sha256"],
+        default="none",
+        help="Optional hashing for stronger matching (slower).",
+    )
+    p1.add_argument(
+        "--hash-threshold-bytes",
+        type=int,
+        default=0,
+        help="Only hash files >= this size (bytes). Use 0 for all sizes.",
+    )
+    p1.add_argument("--progress-every", type=int, default=5000, help="Print progress every N files.")
+
+    p2 = sub.add_parser("phase2", help="Phase 2: create copy plan and/or execute copy.")
+    p2.add_argument("--outdir", required=True, help="Output directory used in Phase 0/1.")
+    p2.add_argument("--dest", required=True, help="Destination folder for copied files.")
+    p2.add_argument(
+        "--mode",
+        choices=["plan", "copy"],
+        default="plan",
+        help="Create a copy plan or execute it.",
+    )
+    p2.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be copied without writing files (copy mode only).",
+    )
+    p2.add_argument("--progress-every", type=int, default=5000, help="Print progress every N files.")
+
     args = parser.parse_args()
+
+    if args.cmd == "phase1":
+        outdir = Path(args.outdir)
+        reports_dir = outdir / "reports"
+        manifest_dir = outdir / "manifests"
+        index_dir = outdir / "index"
+
+        report_path = reports_dir / "discovery_report.json"
+        if not report_path.exists():
+            print(f"ERROR: Missing discovery report: {report_path}", file=sys.stderr)
+            return 2
+
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        master_root = Path(report["paths"]["master"])
+        secondary_root = Path(report["paths"]["secondary"])
+
+        msg = ensure_outdir_not_inside_library(outdir, master_root, secondary_root)
+        if msg:
+            print(f"ERROR: {msg}", file=sys.stderr)
+            return 2
+
+        master_manifest = Path(report["paths"]["master_manifest"])
+        secondary_manifest = Path(report["paths"]["secondary_manifest"])
+        if not master_manifest.exists() or not secondary_manifest.exists():
+            print("ERROR: Missing manifests. Re-run Phase 0 to generate them.", file=sys.stderr)
+            return 2
+
+        print("=== Phase 1: Index + Compare ===", flush=True)
+        print(f"Outdir:    {outdir}", flush=True)
+        print(f"Reports:   {reports_dir}", flush=True)
+        print(f"Index dir: {index_dir}", flush=True)
+        print(f"Hashing:   {args.hash}", flush=True)
+        if args.hash != "none":
+            print(f"Hash size threshold: {args.hash_threshold_bytes} bytes", flush=True)
+        print("", flush=True)
+
+        master_records = read_manifest(master_manifest)
+        secondary_records = read_manifest(secondary_manifest)
+
+        # Build master index by size for fast candidate lookup
+        master_by_size: Dict[int, List[Dict[str, object]]] = {}
+        for rec in master_records:
+            master_by_size.setdefault(int(rec["size"]), []).append(rec)
+
+        hash_cache: Dict[str, str] = {}
+
+        def get_hash(p: Path, size: int) -> Optional[str]:
+            if args.hash == "none":
+                return None
+            if size < args.hash_threshold_bytes:
+                return None
+            key = str(p)
+            if key in hash_cache:
+                return hash_cache[key]
+            try:
+                h = sha256_file(p)
+            except Exception:
+                return None
+            hash_cache[key] = h
+            return h
+
+        matches_size_mtime = 0
+        matches_hash = 0
+        size_mismatch = 0
+        missing_in_master = 0
+        errors = 0
+
+        missing_rows: List[List[str]] = []
+
+        t0 = time.time()
+        last_print = t0
+
+        total_secondary = len(secondary_records)
+        for i, rec in enumerate(secondary_records, start=1):
+            spath = Path(str(rec["path"]))
+            ssize = int(rec["size"])
+            smtime = int(rec["mtime"])
+
+            candidates = master_by_size.get(ssize, [])
+            if not candidates:
+                missing_in_master += 1
+                missing_rows.append([str(spath), str(ssize), str(smtime), "missing_in_master"])
+            else:
+                # First try size+mtime match
+                if any(int(c["mtime"]) == smtime for c in candidates):
+                    matches_size_mtime += 1
+                elif args.hash != "none":
+                    sh = get_hash(spath, ssize)
+                    if sh is None:
+                        errors += 1
+                    else:
+                        matched = False
+                        for c in candidates:
+                            ch = get_hash(Path(str(c["path"])), int(c["size"]))
+                            if ch and ch == sh:
+                                matched = True
+                                break
+                        if matched:
+                            matches_hash += 1
+                        else:
+                            size_mismatch += 1
+                            missing_rows.append([str(spath), str(ssize), str(smtime), "size_or_hash_mismatch"])
+                else:
+                    size_mismatch += 1
+                    missing_rows.append([str(spath), str(ssize), str(smtime), "size_mismatch"])
+
+            if i % args.progress_every == 0:
+                now = time.time()
+                if now - last_print >= 1.0:
+                    rate = i / max(now - t0, 1e-6)
+                    pct = (i / max(total_secondary, 1)) * 100.0
+                    remaining = max(total_secondary - i, 0)
+                    eta = format_duration(remaining / max(rate, 1e-6))
+                    print(
+                        f"[Phase1] {pct:5.1f}% | Compared {i:,}/{total_secondary:,} files "
+                        f"({rate:,.0f} files/sec) | ETA {eta}",
+                        flush=True,
+                    )
+                    last_print = now
+
+        # Write index and reports
+        ensure_writable_dir(index_dir)
+        master_index_path = index_dir / "master_index.jsonl"
+        with open(master_index_path, "w", encoding="utf-8") as f:
+            f.write("# JSONL master index: path/size/mtime\n")
+            for rec in master_records:
+                f.write(json.dumps(rec) + "\n")
+
+        compare_report = {
+            "generated_at_epoch": int(time.time()),
+            "inputs": {
+                "outdir": str(outdir),
+                "master_manifest": str(master_manifest),
+                "secondary_manifest": str(secondary_manifest),
+            },
+            "hashing": {
+                "mode": args.hash,
+                "threshold_bytes": args.hash_threshold_bytes,
+            },
+            "counts": {
+                "secondary_total": len(secondary_records),
+                "matches_size_mtime": matches_size_mtime,
+                "matches_hash": matches_hash,
+                "size_mismatch": size_mismatch,
+                "missing_in_master": missing_in_master,
+                "errors": errors,
+            },
+            "outputs": {
+                "master_index": str(master_index_path),
+            },
+        }
+
+        compare_json = reports_dir / "phase1_compare.json"
+        write_json(compare_json, compare_report)
+
+        missing_csv = reports_dir / "phase1_missing.csv"
+        with open(missing_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["secondary_path", "size_bytes", "mtime_epoch", "reason"])
+            w.writerows(missing_rows)
+
+        summary_lines = [
+            "PHOTOLIB DIFF — PHASE 1 SUMMARY",
+            "",
+            f"Secondary total files: {total_secondary:,}",
+            f"Matches (size+mtime): {matches_size_mtime:,}",
+            f"Matches (hash):       {matches_hash:,}",
+            f"Mismatches:           {size_mismatch:,}",
+            f"Missing in Master:    {missing_in_master:,}",
+            f"Errors:               {errors:,}",
+            "",
+            f"Wrote: {compare_json}",
+            f"Wrote: {missing_csv}",
+            f"Wrote: {master_index_path}",
+        ]
+        out_txt = reports_dir / "phase1_summary.txt"
+        write_text(out_txt, "\n".join(summary_lines))
+
+        print("\n=== Phase 1 Summary ===")
+        print(f"Secondary total: {total_secondary:,}")
+        print(f"Matches size+mtime: {matches_size_mtime:,}")
+        print(f"Matches hash:       {matches_hash:,}")
+        print(f"Mismatches:         {size_mismatch:,}")
+        print(f"Missing in Master:  {missing_in_master:,}")
+        print(f"Errors:             {errors:,}")
+        print(f"\nWrote: {compare_json}")
+        print(f"Wrote: {missing_csv}")
+        print(f"Wrote: {master_index_path}")
+        print(f"Wrote: {out_txt}")
+        return 0
+
+    if args.cmd == "phase2":
+        outdir = Path(args.outdir)
+        dest = Path(args.dest)
+        reports_dir = outdir / "reports"
+        plan_dir = outdir / "plans"
+
+        report_path = reports_dir / "discovery_report.json"
+        if not report_path.exists():
+            print(f"ERROR: Missing discovery report: {report_path}", file=sys.stderr)
+            return 2
+
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        master_root = Path(report["paths"]["master"])
+        secondary_root = Path(report["paths"]["secondary"])
+
+        msg = ensure_outdir_not_inside_library(outdir, master_root, secondary_root)
+        if msg:
+            print(f"ERROR: {msg}", file=sys.stderr)
+            return 2
+
+        msg = ensure_dest_not_inside_library(dest, master_root, secondary_root)
+        if msg:
+            print(f"ERROR: {msg}", file=sys.stderr)
+            return 2
+
+        missing_csv = reports_dir / "phase1_missing.csv"
+        if not missing_csv.exists():
+            print(f"ERROR: Missing Phase 1 missing list: {missing_csv}", file=sys.stderr)
+            return 2
+
+        ensure_writable_dir(plan_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+
+        plan_path = plan_dir / "phase2_copy_plan.csv"
+        plan_rows: List[List[str]] = []
+        with open(missing_csv, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                src = Path(row["secondary_path"])
+                rel = src.relative_to(secondary_root) if src.is_absolute() else src
+                dst = dest / rel
+                plan_rows.append([str(src), str(dst), row["size_bytes"], row["reason"]])
+
+        with open(plan_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["source_path", "dest_path", "size_bytes", "reason"])
+            w.writerows(plan_rows)
+
+        if args.mode == "plan":
+            print("=== Phase 2: Copy Plan ===")
+            print(f"Wrote: {plan_path}")
+            print(f"Rows:  {len(plan_rows):,}")
+            return 0
+
+        print("=== Phase 2: Copy ===")
+        print(f"Plan:  {plan_path}")
+        print(f"Dest:  {dest}")
+        if args.dry_run:
+            print("Mode:  DRY RUN (no files will be written)")
+
+        t0 = time.time()
+        last_print = t0
+        total = len(plan_rows)
+        copied = 0
+        skipped = 0
+        errors = 0
+
+        for i, row in enumerate(plan_rows, start=1):
+            src = Path(row[0])
+            dst = Path(row[1])
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if args.dry_run:
+                    skipped += 1
+                else:
+                    shutil.copy2(src, dst)
+                    copied += 1
+            except Exception:
+                errors += 1
+
+            if i % args.progress_every == 0:
+                now = time.time()
+                if now - last_print >= 1.0:
+                    rate = i / max(now - t0, 1e-6)
+                    pct = (i / max(total, 1)) * 100.0
+                    remaining = max(total - i, 0)
+                    eta = format_duration(remaining / max(rate, 1e-6))
+                    print(
+                        f"[Phase2] {pct:5.1f}% | {i:,}/{total:,} files "
+                        f"({rate:,.0f} files/sec) | ETA {eta}",
+                        flush=True,
+                    )
+                    last_print = now
+
+        summary_lines = [
+            "PHOTOLIB DIFF — PHASE 2 SUMMARY",
+            "",
+            f"Planned files: {total:,}",
+            f"Copied:        {copied:,}",
+            f"Skipped:       {skipped:,}",
+            f"Errors:        {errors:,}",
+            "",
+            f"Plan: {plan_path}",
+            f"Dest: {dest}",
+        ]
+        out_txt = reports_dir / "phase2_summary.txt"
+        write_text(out_txt, "\n".join(summary_lines))
+
+        print("\n=== Phase 2 Summary ===")
+        print(f"Planned files: {total:,}")
+        print(f"Copied:        {copied:,}")
+        print(f"Skipped:       {skipped:,}")
+        print(f"Errors:        {errors:,}")
+        print(f"Wrote: {out_txt}")
+        return 0
 
     if args.cmd != "discover":
         return 1
@@ -359,27 +844,23 @@ def main() -> int:
             return 2
 
     if not (master and secondary and outdir):
-        print(
-            "ERROR: Missing required paths. Provide --master, --secondary, --outdir or use --gui.",
-            file=sys.stderr,
-        )
+        if args.gui:
+            print(
+                "ERROR: Selection was canceled or incomplete. Please re-run and finish all selections.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "ERROR: Missing required paths. Provide --master, --secondary, --outdir or use --gui.",
+                file=sys.stderr,
+            )
         return 2
 
     # Ensure we never write inside a Photos library bundle.
-    for name, pth in [("Master", master), ("Secondary", secondary)]:
-        try:
-            out_resolved = outdir.resolve()
-            lib_resolved = pth.resolve()
-        except FileNotFoundError:
-            out_resolved = outdir
-            lib_resolved = pth
-        if out_resolved == lib_resolved or out_resolved in lib_resolved.parents:
-            print(
-                f"ERROR: Outdir is inside {name} library bundle. Choose a different output folder.\n"
-                f"  Outdir: {outdir}\n  {name}: {pth}",
-                file=sys.stderr,
-            )
-            return 2
+    msg = ensure_outdir_not_inside_library(outdir, master, secondary)
+    if msg:
+        print(f"ERROR: {msg}", file=sys.stderr)
+        return 2
 
     # Prepare output structure (and verify write access)
     ensure_writable_dir(outdir)
@@ -428,12 +909,14 @@ def main() -> int:
             master,
             progress_every=args.progress_every,
             manifest_path=master_manifest,
+            precount=not args.no_precount,
         )
         secondary_info = discover_library(
             "Secondary",
             secondary,
             progress_every=args.progress_every,
             manifest_path=secondary_manifest,
+            precount=not args.no_precount,
         )
     except Exception as e:
         print("\nERROR during discovery:\n", file=sys.stderr)
